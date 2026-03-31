@@ -1,6 +1,6 @@
 ---
 name: common-pitfalls
-description: Use when encountering Python dependency errors, React state issues, CSS ellipsis problems, Ant Design Upload/Table issues, Zustand persistence problems, react-dnd drag vibration, data sync design decisions, AI/OCR text matching failures, cross-platform Unicode (NFD/NFC) issues, Pydantic model_dump pitfalls, FastAPI request format mismatches, database safety concerns, localStorage limitations, import data uniqueness, or VPS/remote server operations
+description: Use when encountering Python dependency errors, React state issues, CSS ellipsis problems, Ant Design Upload/Table issues, Zustand persistence problems, react-dnd drag vibration, data sync design decisions, AI/OCR text matching failures, cross-platform Unicode (NFD/NFC) issues, Pydantic model_dump pitfalls, FastAPI request format mismatches, database safety concerns, localStorage limitations, import data uniqueness, VPS/remote server operations, LiveKit/Gemini/OpenAI realtime voice AI latency tuning, Japanese speech_end_offset/silence_duration settings, SIP NAT traversal with Docker Desktop for Mac, cloud PBX vs SIP trunk compatibility issues, LLM API cost estimation (thinking tokens), model deprecation risks, Claude Agent/Sub-agent file passing, Express dashboard security (localhost binding), SQLite WAL mode transfer, or cron automation with AI bots
 ---
 
 # Common Development Pitfalls
@@ -532,6 +532,261 @@ for key in seen_keys:
 3. If SSH fails from Claude Code, it's likely a network restriction — don't "fix" the server
 4. Deploy via user's terminal, not Claude Code SSH
 
+## Realtime Voice AI (LiveKit + Gemini/OpenAI)
+
+### speech_end_offset は日本語では1.5秒が適正値
+
+**Symptom:** AIがユーザーの発話中に割り込む。日本語の句間ポーズを発話終了と誤検出
+
+**Cause:** `speech_end_offset`（Gemini）や`silence_duration_ms`（OpenAI）を短くしすぎると、日本語の自然な間（0.5〜1秒程度）を「話し終わった」と判定する
+
+**テスト結果:**
+
+| 設定値 | 結果 |
+|---|---|
+| 0.5秒 / 300ms | 頻繁に割り込み。文の途中で応答開始 |
+| 1.0秒 / 500ms | 改善するが依然割り込みあり |
+| 1.5秒 / 700ms | 割り込み大幅減。デフォルト（約2秒）より速く応答 |
+
+**Fix:**
+```python
+# Gemini
+from google.genai import types
+realtime_input_config=types.RealtimeInputConfig(
+    automatic_activity_detection=types.AutomaticActivityDetection(
+        speech_end_offset=types.Duration(seconds=1, nanos=500_000_000),  # 1.5秒
+    ),
+)
+
+# OpenAI
+from openai.types.beta.realtime.session import TurnDetection
+turn_detection=TurnDetection(
+    type="server_vad",
+    threshold=0.5,
+    prefix_padding_ms=300,
+    silence_duration_ms=700,  # 0.7秒
+)
+```
+
+**Key lesson:** 英語ベースのデフォルト値をそのまま日本語に適用してはいけない。日本語は句間ポーズが長いため、攻めすぎると会話が成立しない。
+
+### System Prompt の長さがリアルタイム音声APIのレイテンシに直結する
+
+**Symptom:** AIの初回応答が遅い。ユーザーが話し終わってから数秒待たされる
+
+**Cause:** Realtime APIはsystem_promptを毎ターンの推論コンテキストに含める。長いプロンプト = 推論時間増加
+
+**Fix:** 電話サポート用プロンプトは1,000文字以内を目標に圧縮。ルールの本質を維持しつつ箇条書きを簡潔にする。
+
+```yaml
+# Before: 約2,200文字 — 冗長な説明、対話フローの詳細例
+# After:  約700文字  — 箇条書きのみ、例示削除
+
+# 圧縮のコツ:
+# - 「〜してください。〜の場合は〜してください。」→ 箇条書き1行
+# - 対話フロー例は削除（AIは理解している）
+# - 重複ルールを統合
+```
+
+**同時に効果がある設定:**
+- `temperature` 0.8→0.4（生成速度向上、電話対応では一貫性が重要）
+- RAG検索結果 `n_results` 3→2（ツール結果のトークン数削減）
+
+### Docker Desktop for Mac で SIP が動かない
+
+**Symptom:** Asterisk（Docker内）がSIPサーバーにREGISTER成功するが、着信のSIP INVITEが一切届かない
+
+**Cause:** Docker Desktop for MacはVM経由のネットワークを使用。`network_mode: host`はVM内のネットワークを指し、Mac本体ではない。さらにポートマッピングも`vpnkit`プロキシ層を経由するため、SIPのUDP通信（ペイロード内IP/Portとパケット送信元の一致要件）と相性が極めて悪い。
+
+**Fix:** ローカルMacでSIPをテストする方法はない（現実的ではない）。Linux VPSにデプロイする。
+
+```text
+# ローカルMacの問題:
+# 1. network_mode: host → VM内のみ、Mac本体ではない
+# 2. ブリッジ+ポートマッピング → vpnkitプロキシで二重NAT
+# 3. ルーターNAT + Docker NAT = SIPパケットがロスト
+
+# 解決策の優先順位:
+# 1. Linux VPSにデプロイ（推奨・確実）
+# 2. OrbStackを使う（Dockerより透過的なネットワーク）
+# 3. Asteriskをmac本体にネイティブインストール
+```
+
+**Key lesson:** SIP/RTPのようなUDPプロトコルはNAT越えが複雑。Docker Desktop for Macでの動作を前提にしない。開発初期からVPSでの動作確認を計画に含める。
+
+### ナイセンクラウド等のクラウドPBXはSIPトランクではない
+
+**Symptom:** クラウドPBXにREGISTER成功するが、着信時にSIP INVITEが送信されない
+
+**Cause:** 多くのクラウドPBXサービス（ナイセンクラウド等）は標準SIP INVITEによる着信配信をサポートしていない。アプリ専用のプッシュ通知（Acrobits SIPIS等）で着信を配信しており、Asterisk等の標準SIPクライアントでは着信を受けられない。
+
+**Fix:** AI自動応答にはTwilio SIP Trunk等の標準SIPトランクプロバイダーを使用する。
+
+**確認すべき項目（開発着手前）:**
+1. SIPサービスが標準SIP INVITEで着信を配信するか？
+2. IP認証ベースのSIPトランク接続に対応しているか？
+3. Asterisk等の汎用SIPクライアントでの動作実績があるか？
+
+**Key lesson:** REGISTERが成功する≠着信を受けられる。クラウドPBXとSIPトランクは別物。Phase 0で必ず確認すること。
+
+## LLM API Integration
+
+### 思考トークン（Thinking Tokens）でコストが50倍になる
+
+**Symptom:** Gemini 2.5 Flashで842件分析を「約$0.03」と見積もったが実際は$7.76
+
+**Cause:** Gemini 2.5 Flashはデフォルトで思考トークンを大量生成。1リクエストあたり入力388 + 出力101に対し、**思考2,599トークン**（全体の84%）。思考トークンの単価は入力/出力の数倍。
+
+**Fix:** コスト見積もり前に必ず1件の実測:
+```javascript
+const result = await model.generateContent({...});
+const u = result.response.usageMetadata;
+console.log('入力:', u.promptTokenCount);
+console.log('出力:', u.candidatesTokenCount);
+console.log('思考:', u.thoughtsTokenCount);  // ← これを見落とす
+console.log('合計:', u.totalTokenCount);
+// 見積もり = 合計 × 件数 × 単価
+```
+
+**思考を無効化する場合（REST API直接）:**
+```javascript
+generationConfig: {
+  thinkingConfig: { thinkingBudget: 0 }  // 思考トークン完全ゼロ
+}
+// 注: SDK経由だと効かない場合がある。REST API直接呼出しが確実
+```
+
+**Key lesson:** 分類・抽出タスクに思考は不要。`thinkingBudget: 0`でコスト1/250に削減可能。
+
+### LLMモデルは突然廃止される
+
+**Symptom:** `gemini-2.0-flash`が404 Not Found「no longer available to new users」
+
+**Cause:** Googleがモデルを予告なく新規利用停止にした
+
+**Fix:**
+```typescript
+// NG: ハードコード
+const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+// OK: 設定ファイルで管理
+const model = genAI.getGenerativeModel({ model: config.geminiModel });
+// .env: GEMINI_MODEL=gemini-2.5-flash
+```
+
+**Key lesson:** 外部APIのモデル名は環境変数で管理。ハードコードしない。
+
+### サブスク内で完結する方法を最優先に検討する
+
+**Symptom:** 外部API（Gemini等）のコスト・レート制限・モデル廃止に振り回される
+
+**Cause:** 最初から外部APIありきで設計
+
+**Fix — 優先順位:**
+1. **サブスク内で完結** — OpenClaw/Claude Codeのボットに委任（コスト0）
+2. **Claude Agent並列** — Sonnet Agentを並列起動してバッチ処理（サブスク内）
+3. **外部API（思考なし）** — どうしても必要な場合のみ
+
+**Key lesson:** ユーザーが既にサブスクを持つサービスで処理できないか最初に検討。外部APIは最後の手段。
+
+## Claude Agent / Sub-agent
+
+### Sub-agentに渡すJSONファイルはpretty-printする
+
+**Symptom:** Sub-agentが「ファイルが10,000トークン制限を超えている」と報告。offset/limitも効かない
+
+**Cause:** `JSON.stringify(data)`は1行のJSONを出力。Readツールは行単位でoffset/limitを適用するため、1行=全体となり分割読みできない
+
+**Fix:**
+```javascript
+// NG: 1行JSON — Sub-agentのReadツールで読めない
+fs.writeFileSync('data.json', JSON.stringify(data));
+
+// OK: pretty-print — 行分割でoffset/limitが効く
+fs.writeFileSync('data.json', JSON.stringify(data, null, 1));
+```
+
+**Key lesson:** Agent間でファイルを受け渡す場合、pretty-print JSONを使う。巨大ファイルは事前に分割（50〜80件/ファイル）。
+
+### 分類タスクにはSonnet、推論タスクにはOpus
+
+**Symptom:** Opusで842件の分析を実行 → $3.20。Sonnetなら$1.92
+
+**Cause:** 分類・抽出・スコアリングは「考える」必要が少なく、Sonnetで十分な精度
+
+**判断基準:**
+| タスク | 推奨モデル | 理由 |
+|---|---|---|
+| 分類・ラベル付け | Sonnet | パターンマッチに近い |
+| JSON抽出・構造化 | Sonnet | スキーマ固定で精度差なし |
+| 複雑な推論・設計 | Opus | 深い思考が必要 |
+| コード生成・リファクタ | Opus | 文脈理解が重要 |
+
+## Express Dashboard Security
+
+### 内部ツールでもlocalhostバインドは最初から
+
+**Symptom:** ダッシュボードが`0.0.0.0:3000`で全インターフェースにリッスン、外部からアクセス可能
+
+**Cause:** Express `app.listen(PORT)` はデフォルトで全インターフェースにバインド
+
+**Fix — 3重防御:**
+```typescript
+// 1. localhostバインド
+const BIND = process.env.DASHBOARD_BIND || "127.0.0.1";
+app.listen(Number(PORT), BIND, () => { ... });
+
+// 2. UFWファイアウォール
+// $ ufw deny 3000/tcp
+
+// 3. SSHトンネルでのみアクセス
+// $ ssh -L 3000:127.0.0.1:3000 vps
+```
+
+**Key lesson:** 「内部ツールだから」で後回しにしない。最初からlocalhostバインド。
+
+## SQLite Transfer (VPS Deploy)
+
+### WALモード使用中のDB転送はテーブルが見えないことがある
+
+**Symptom:** rsyncでjobs.dbを転送したが、VPS側で「no such table」エラー
+
+**Cause:** SQLiteのWALモード（`journal_mode = WAL`）では、未コミットの変更が`.db-wal`ファイルに保持される。`.db`ファイルだけ転送すると不完全
+
+**Fix:**
+```bash
+# 送信側: SQL dumpで確実にエクスポート
+sqlite3 local.db ".dump table_name" > dump.sql
+
+# 受信側: インポート
+sqlite3 remote.db < dump.sql
+```
+
+**Key lesson:** SQLiteのDB転送はファイルコピーではなく`.dump`→インポートが確実。
+
+## Cron Automation with AI Bots
+
+### cronのトリガーはシンプルに、処理はAIボットに委任
+
+**Symptom:** シェルスクリプトで「JSON抽出→Claude CLI→結果パース→DB保存」の複雑なパイプライン → 途中で壊れやすい
+
+**Cause:** 中間ステップが多いほど壊れやすい。エラーハンドリングもスクリプト側で全て書く必要がある
+
+**Fix:**
+```bash
+# NG: 複雑なパイプライン
+sqlite3 db "SELECT ..." > /tmp/data.json
+claude --model sonnet --print -p "..." > /tmp/result.json
+python3 -c "import json; ..." # パース&保存
+
+# OK: AIボットに1メッセージ送るだけ
+openclaw agent --agent analyzer -m "新着案件を分析して" --deliver
+```
+
+**前提:** ボットのワークスペースにCLAUDE.mdで手順を記述しておく。ボットが手順を読み、自律的に処理・エラーハンドリング・完了報告を行う。
+
+**Key lesson:** AIボットが使える環境なら、スクリプトで全手順を書くよりボットに委任する方がメンテナンス性が高い。
+
 ## Quick Checklist
 
 Before debugging, check these common causes:
@@ -558,3 +813,16 @@ Before debugging, check these common causes:
 - [ ] DB safety: Using ALTER/UPDATE instead of delete+recreate?
 - [ ] Storage: Shared settings on server, not localStorage?
 - [ ] VPS: Never modifying SSH config remotely?
+- [ ] Voice AI: Japanese speech_end_offset ≥ 1.5s? (not 0.5s)
+- [ ] Voice AI: System prompt under 1,000 chars for realtime API?
+- [ ] Voice AI: temperature ≤ 0.4 for phone support?
+- [ ] SIP: Cloud PBX supports standard SIP INVITE? (verified before dev)
+- [ ] Docker Mac: NOT testing SIP/RTP on Docker Desktop for Mac?
+- [ ] LLM API: 思考トークンを含めた実測コストを確認した?
+- [ ] LLM API: モデル名を環境変数で管理（ハードコードしていない)?
+- [ ] LLM API: サブスク内で完結する方法を先に検討した?
+- [ ] Agent: Sub-agentに渡すJSONはpretty-print?
+- [ ] Agent: 分類タスクにSonnet（Opusではなく）を使用?
+- [ ] Express: `app.listen`にlocalhostバインドを指定?
+- [ ] SQLite: WALモードのDB転送は`.dump`を使用?
+- [ ] Cron: 複雑なパイプラインではなくAIボットに委任?
