@@ -1,6 +1,6 @@
 ---
 name: common-pitfalls
-description: Use when encountering Python dependency errors, React state issues, CSS ellipsis problems, Ant Design Upload/Table issues, Zustand persistence problems, react-dnd drag vibration, data sync design decisions, AI/OCR text matching failures, cross-platform Unicode (NFD/NFC) issues, Pydantic model_dump pitfalls, FastAPI request format mismatches, database safety concerns, localStorage limitations, import data uniqueness, VPS/remote server operations, LiveKit/Gemini/OpenAI realtime voice AI latency tuning, Japanese speech_end_offset/silence_duration settings, SIP NAT traversal with Docker Desktop for Mac, cloud PBX vs SIP trunk compatibility issues, LLM API cost estimation (thinking tokens), model deprecation risks, Claude Agent/Sub-agent file passing, Express dashboard security (localhost binding), SQLite WAL mode transfer, or cron automation with AI bots
+description: Use when encountering Python dependency errors, React state issues, CSS ellipsis problems, Ant Design Upload/Table issues, Zustand persistence problems, react-dnd drag vibration, data sync design decisions, AI/OCR text matching failures, cross-platform Unicode (NFD/NFC) issues, Pydantic model_dump pitfalls, FastAPI request format mismatches, database safety concerns, localStorage limitations, import data uniqueness, VPS/remote server operations, LiveKit/Gemini/OpenAI realtime voice AI latency tuning, Japanese speech_end_offset/silence_duration settings, SIP NAT traversal with Docker Desktop for Mac, cloud PBX vs SIP trunk compatibility issues, LLM API cost estimation (thinking tokens), model deprecation risks, Claude Agent/Sub-agent file passing, Express dashboard security (localhost binding), SQLite WAL mode transfer, cron automation with AI bots, Gemini Vision API multi-image accuracy degradation, PDF multi-page processing pitfalls, or Docker Compose volume reference loss
 ---
 
 # Common Development Pitfalls
@@ -787,6 +787,83 @@ openclaw agent --agent analyzer -m "新着案件を分析して" --deliver
 
 **Key lesson:** AIボットが使える環境なら、スクリプトで全手順を書くよりボットに委任する方がメンテナンス性が高い。
 
+## Gemini Vision API / PDF Processing
+
+### 画像PDFの複数ページを一括送信すると特定フィールドの精度が著しく低下する
+
+**Symptom:** 2ページの画像PDFをGemini Vision APIに一括送信すると、`delivery_location`（納品先）に店舗名ではなく商品コード（`CTJ J`）が入る。同じPDFを1ページずつ別々に送信すると正確に抽出される。
+
+**Cause:** Gemini Vision APIは複数画像を同時に処理すると、各画像のフィールド抽出精度が低下する。特に画像間で類似したレイアウトがある場合、フィールドの取り違えが発生する。
+
+**Fix:**
+```python
+# ❌ 画像PDF: 一括送信（精度低下）
+pil_images = [PIL.Image.open(io.BytesIO(img)) for img in all_images]
+response = model.generate_content(pil_images + [prompt])
+
+# ✅ 画像PDF: ページ単位で個別送信
+for i, image_bytes in enumerate(all_images):
+    pil_image = PIL.Image.open(io.BytesIO(image_bytes))
+    response = model.generate_content([pil_image, prompt])
+    results.extend(parse_json_response(response.text))
+```
+
+**Note:** テキストPDFはページ区切りマーカー付きで一括送信しても精度が保たれる。画像PDFのみこの制約がある。
+
+**Key lesson:** Gemini Vision APIで複数画像を扱う場合、精度が重要なフィールドがあるなら1画像ずつ個別送信する。一括送信はコスト削減になるが精度トレードオフがある。
+
+### GeminiにJSON配列を要求しても単一オブジェクトが返る
+
+**Symptom:** プロンプトで「JSON配列で返してください」と指示しても、1件の場合に `{...}` で返すことがある
+
+**Fix:** JSON解析で配列優先 + 単一オブジェクトフォールバック:
+```python
+def parse_json_response(text: str) -> Optional[List[dict]]:
+    # 配列形式を優先検出
+    match = re.search(r'\[[\s\S]*\]', text)
+    if match:
+        data = json.loads(match.group())
+        if isinstance(data, list):
+            return data
+    # フォールバック: 単一オブジェクト → 配列に変換
+    match = re.search(r'\{[\s\S]*\}', text)
+    if match:
+        data = json.loads(match.group())
+        if isinstance(data, dict):
+            return [data]
+    return None
+```
+
+**Key lesson:** LLM出力は指示通りの形式で返る保証がない。解析側で後方互換のフォールバックを必ず用意する。
+
+## Docker Compose Volume Management
+
+### `docker compose down` でボリューム参照が切れてDBが空になる
+
+**Symptom:** `docker compose down` → `docker compose up -d` を実行したところ、DBが空になった（テーブルは存在するがデータなし）
+
+**Cause:** `docker compose down` がコンテナとネットワークを削除する際、named volumeは削除されないが、新しい `up -d` で別のボリュームが作成されることがある。特にcompose projectの名前が変わった場合やvolumeの参照が不整合になった場合に発生。
+
+**Fix:**
+```bash
+# ❌ docker compose down は使わない（ボリューム参照が切れるリスク）
+docker compose down
+docker compose up -d
+
+# ✅ コンテナだけ削除して再作成（ボリュームは確実に保持）
+docker rm -f container-name
+docker compose up -d --build
+```
+
+**Recovery:** 旧ボリュームが残っている場合は `docker volume ls` で探し、データをコピー:
+```bash
+# 旧ボリュームからDBを復元
+cp /var/lib/docker/volumes/old_volume/_data/database/app.db \
+   /var/lib/docker/volumes/new_volume/_data/database/app.db
+```
+
+**Key lesson:** Dockerでの再起動は `docker rm -f` + `up -d` が最も安全。`down` はボリューム参照を壊すリスクがある。再起動後は必ずDBのデータ件数を確認する。
+
 ## Quick Checklist
 
 Before debugging, check these common causes:
@@ -826,3 +903,7 @@ Before debugging, check these common causes:
 - [ ] Express: `app.listen`にlocalhostバインドを指定?
 - [ ] SQLite: WALモードのDB転送は`.dump`を使用?
 - [ ] Cron: 複雑なパイプラインではなくAIボットに委任?
+- [ ] Gemini Vision: 画像PDFは1ページずつ個別送信（一括送信しない）?
+- [ ] Gemini: JSON解析に配列+単一オブジェクト両方のフォールバックがある?
+- [ ] Docker: `docker compose down` ではなく `docker rm -f` + `up -d` で再起動?
+- [ ] Docker: 再起動後にDBデータ件数を確認した?
