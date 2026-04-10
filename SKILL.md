@@ -1,6 +1,6 @@
 ---
 name: common-pitfalls
-description: Use when encountering Python dependency errors, React state issues, CSS ellipsis problems, Ant Design Upload/Table issues, Zustand persistence problems, react-dnd drag vibration, data sync design decisions, AI/OCR text matching failures, cross-platform Unicode (NFD/NFC) issues, Pydantic model_dump pitfalls, FastAPI request format mismatches, database safety concerns, localStorage limitations, import data uniqueness, VPS/remote server operations, LiveKit/Gemini/OpenAI realtime voice AI latency tuning, Japanese speech_end_offset/silence_duration settings, SIP NAT traversal with Docker Desktop for Mac, cloud PBX vs SIP trunk compatibility issues, LLM API cost estimation (thinking tokens), model deprecation risks, Claude Agent/Sub-agent file passing, Express dashboard security (localhost binding), SQLite WAL mode transfer, cron automation with AI bots, Gemini Vision API multi-image accuracy degradation, PDF multi-page processing pitfalls, or Docker Compose volume reference loss
+description: Use when encountering Python dependency errors, React state issues, CSS ellipsis problems, Ant Design Upload/Table issues, Zustand persistence problems, react-dnd drag vibration, data sync design decisions, AI/OCR text matching failures, cross-platform Unicode (NFD/NFC) issues, Pydantic model_dump pitfalls, FastAPI request format mismatches, database safety concerns, localStorage limitations, import data uniqueness, VPS/remote server operations, LiveKit/Gemini/OpenAI realtime voice AI latency tuning, Japanese speech_end_offset/silence_duration settings, SIP NAT traversal with Docker Desktop for Mac, cloud PBX vs SIP trunk compatibility issues, LLM API cost estimation (thinking tokens), model deprecation risks, Claude Agent/Sub-agent file passing, Express dashboard security (localhost binding), SQLite WAL mode transfer, cron automation with AI bots, Gemini Vision API multi-image accuracy degradation, PDF multi-page processing pitfalls, Docker Compose volume reference loss, Docker bind mount relative path pitfalls in rsync-deployed environments, debugging mindset (timestamp gaps interpretation), or design tradeoffs (DRY/symlink vs simple/copy)
 ---
 
 # Common Development Pitfalls
@@ -864,6 +864,85 @@ cp /var/lib/docker/volumes/old_volume/_data/database/app.db \
 
 **Key lesson:** Dockerでの再起動は `docker rm -f` + `up -d` が最も安全。`down` はボリューム参照を壊すリスクがある。再起動後は必ずDBのデータ件数を確認する。
 
+### bind mount の相対パスがrsync階層差で別の場所を指す
+
+**Symptom:** Docker再ビルド後、VPSで `FileNotFoundError: /app/templates/xxx.xlsx` のような500エラー。ローカルでは同じコードが正常動作。
+
+**Cause:** `docker-compose.yml` の bind mount が相対パス（例: `../06_テンプレート:/app/templates:ro`）。compose ファイルの位置がローカル↔本番で違う場合、`../` の解決先が変わる：
+
+| 環境 | compose 位置 | `../foo` の解決先 |
+|---|---|---|
+| ローカル | `src/docker-compose.yml` | `プロジェクトルート/foo` ✓ |
+| VPS | `/root/app/docker-compose.yml`（rsyncで構造が1階層潰れる） | `/root/foo` ✗ |
+
+さらに悪いことに、**Docker は bind mount ターゲットが不存在だと空ディレクトリを自動作成**する。結果：
+- コンテナは正常起動（マウントエラーなし）
+- `/app/templates/` は空
+- 実行時にファイル読み込みで初めてエラー
+
+**Fix:**
+```bash
+# 本番ターゲットにファイルを直接配置（copy推奨、symlinkより確実）
+ssh vps 'mkdir -p /root/foo && \
+         cp -p /root/app/foo/*.xlsx /root/foo/ && \
+         docker restart app-backend'
+```
+
+**Key lesson:**
+- Docker compose の相対 mount パスは、compose ファイルの位置に依存する。**ローカルと本番で階層が違う環境では絶対パス・環境変数・ビルドコンテキスト配下のパスを使う**
+- bind mount ターゲットが空なのに docker が起動している → **docker が勝手に作った可能性を疑う**
+- named volume（DB）と bind mount（設定ファイル等）は別機構。片方が影響を受けた時、もう片方も同時に調査する
+
+## Debugging Mindset (プロセスの教訓)
+
+### タイムスタンプのギャップだけで「別事象」と断定しない
+
+**Symptom:** 2つの問題が発生し、ログのタイムスタンプが数時間離れているため「別の原因」と結論づけた後、ユーザーから「同じ作業の結果だ」と指摘される。
+
+**Cause:** 機械のログのタイムスタンプと、人間の作業タイムラインは別の時間軸：
+- ユーザーが休憩・食事・睡眠・会議を挟めば、同じ作業セッション内でも数時間〜1日以上空く
+- 「同じ根本原因 → 異なる時刻」は普通にあり得る
+- 物証（ログ）だけで推論すると、人間の介在を見落とす
+
+**Real-world example:**
+- DB 消失（Apr 9 **01:34**）と templates 消失（Apr 9 **10:35**）の 9 時間差から「別事象」と判断
+- ユーザー: 「9 時間のずれは、単純に私が休みをとったから」
+- 実際は同じ `docker compose down` → `up -d --build` から発生した連続作業
+
+**Fix (debugging process):**
+1. タイムスタンプ差を見つけても、独立した事象と決めつけない
+2. ユーザーに「この時間帯に何をしていましたか」と先に聞く
+3. ユーザー仮説（「同じ原因では？」）を物証だけで早々に否定しない
+4. 物証と状況証拠（ユーザーの記憶）を両方統合する
+
+**Key lesson:** ユーザーは自分が何をしたか知っている。Claude の推論はしばしば不完全な物証に基づく。**ユーザーが「同じ原因」と言ったら、推論より優先的に検証する**。
+
+### 「DRY」や「賢さ」より「シンプルで透過的」を優先する
+
+**Symptom:** エンジニア的な「賢い解」を選んだ後、ユーザーから「なぜ素朴な方法にしないのか？」と指摘される。
+
+**Cause:** 「重複を避ける」「エレガント」に寄りすぎて、運用者の視点（誰がどう保守するか）を見落とす。
+
+**Real-world example:** VPS テンプレート配置で symlink（賢い・DRY）を選択
+- symlink の「自動反映」メリットは、元ディレクトリが同期対象外のため幻想（どちらも手動同期必要）
+- symlink はリンク切れという失敗モードを追加
+- ユーザー指摘で copy 方式に切替 → シンプルで自己完結、壊れない
+
+**Fix (design process):**
+複数の方法があるとき、まず「最もシンプルで透過的な方法」を第一候補にする。判断基準：
+
+| 問い | 意図 |
+|---|---|
+| このトリックで得られるものは何か？ | 実利を明確化 |
+| 素朴な方法で十分でないか？ | 過剰設計チェック |
+| 新しい失敗モードを追加しないか？ | リスク評価 |
+| 6 ヶ月後の自分（他人）が理解できるか？ | 保守性チェック |
+
+**Key lesson:**
+- **DRY は手段であって目的ではない**。単一ソースにしても同期作業が必要なら DRY の恩恵は消える
+- **エンジニア的な「賢い解」が運用者にとって負債になることがある**。運用コンテキストを先に確認する
+- symlink、動的リンク、間接参照、複雑なマクロ、ジェネリック抽象化などの「賢い」仕組みは、本当にメリットがある時だけ使う
+
 ## Quick Checklist
 
 Before debugging, check these common causes:
@@ -907,3 +986,9 @@ Before debugging, check these common causes:
 - [ ] Gemini: JSON解析に配列+単一オブジェクト両方のフォールバックがある?
 - [ ] Docker: `docker compose down` ではなく `docker rm -f` + `up -d` で再起動?
 - [ ] Docker: 再起動後にDBデータ件数を確認した?
+- [ ] Docker: compose の bind mount は絶対パスまたはビルドコンテキスト配下を使用している（相対 `../` は避ける）?
+- [ ] Docker: bind mount ターゲットが空になっていないか確認した（docker が勝手に作った可能性）?
+- [ ] Debug: タイムスタンプ差だけで「別事象」と断定していないか? ユーザーの作業タイムラインを確認した?
+- [ ] Debug: ユーザー仮説（「同じ原因では？」）を物証だけで早々に否定していないか?
+- [ ] Design: symlink・動的リンク等の「賢い」仕組みは、素朴な copy より本当に優位か?
+- [ ] Design: 6 ヶ月後の自分（他人）がこの設計を理解できるか?
